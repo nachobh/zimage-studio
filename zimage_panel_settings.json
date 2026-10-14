@@ -1,0 +1,16 @@
+{
+  "defaults": {
+    "width": 256,
+    "height": 512,
+    "steps": 9,
+    "cfg": 0,
+    "seed": 42,
+    "random": true,
+    "weight": 0.8,
+    "negative": ""
+  },
+  "chat_url": "http://127.0.0.1:8086/v1",
+  "chat_model": "",
+  "zimage_url": "tcp://127.0.0.1:9877",
+  "mcp_url": "http://127.0.0.1:8765/mcp"
+}

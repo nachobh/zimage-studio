@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "zimage": {
+      "command": "~/ai-rocm-venv/bin/python3",
+      "args": ["~/zimage_panel_project/zimage_mcp_server.py"],
+      "enabled": true
+    }
+  }
+}

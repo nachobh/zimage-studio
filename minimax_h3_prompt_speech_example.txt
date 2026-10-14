@@ -1,0 +1,7 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Live-action portrait. The woman from <Picture 1> faces the camera in the same setting and clothing. She blinks naturally, turns her head slightly, and in a clear, gentle adult female voice (S1) says: <d>[English] Hello, nice to see you.</d> Her lips move in sync with the short sentence. The camera remains steady.
+
+overall_soundscape: Clear close-microphone speech over faint indoor room tone, with a soft rustle of hair and clothing.
+
+non_diegetic_music: N/A.

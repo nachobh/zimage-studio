@@ -1,0 +1,6 @@
+comfyui:
+  base_path: ~/models/minimax-h3-q4/
+  diffusion_models: diffusion_models/
+  unet: diffusion_models/
+  text_encoders: text_encoders/
+  vae: vae/
