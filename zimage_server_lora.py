@@ -29,8 +29,10 @@ os.environ['FLASH_ATTENTION_TRITON_AMD_AUTOTUNE'] = 'FALSE'
 MODEL_DIR = os.environ.get("ZIMAGE_BASE_PIPELINE", "~/models/zimage-official")
 LORA_DIR = os.environ.get("ZIMAGE_LORA_DIR", "~/lora_models_peft")
 OUTPUT_DIR = os.environ.get("ZIMAGE_OUTPUT_DIR", os.path.expanduser("~/zimage_outputs"))
-SERVER_HOST = "0.0.0.0"
-SERVER_PORT = 9876
+# Loopback by default like the rest of the stack; override via env vars.
+# (Legacy V4 hardcoded 0.0.0.0:9876; the stack standard backend port is 9877.)
+SERVER_HOST = os.environ.get("ZIMAGE_SERVER_HOST", "127.0.0.1")
+SERVER_PORT = int(os.environ.get("ZIMAGE_SERVER_PORT", "9877"))
 PID_FILE = "/tmp/zimage_server_lora.pid"
 LOG_FILE = "/tmp/zimage_server_lora.log"
 

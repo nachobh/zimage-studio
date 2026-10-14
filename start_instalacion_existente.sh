@@ -21,9 +21,9 @@ fi
 
 # Los argumentos explícitos van al final: --https-ip prevalece sobre el valor
 # local predeterminado. El lanzador conserva --status/--dry-run sin cambios.
-# El acceso a la instalación existente publica HTTP y HTTPS en todas las
-# interfaces; el usuario puede limitarlo con ZIMAGE_PANEL_HOST.
-export ZIMAGE_PANEL_HOST="${ZIMAGE_PANEL_HOST:-0.0.0.0}"
+# Por defecto el panel escucha solo en loopback; para publicar HTTP y HTTPS
+# en todas las interfaces, exporta ZIMAGE_PANEL_HOST=0.0.0.0.
+export ZIMAGE_PANEL_HOST="${ZIMAGE_PANEL_HOST:-127.0.0.1}"
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
@@ -32,7 +32,7 @@ for arg in "$@"; do
       echo '--with-comfyui exige el lanzador local de MiniMax-H3 (API loopback :9879); --no-comfyui lo desactiva (viene activado por defecto).'
       echo '--stop detiene los servicios gestionados; --stop --dry-run muestra la parada.'
       echo '--restart-qwen3-tts reinicia solo Qwen3-TTS sin tocar el panel ni el stack.'
-      echo 'Panel HTTP/HTTPS: 0.0.0.0 por defecto; ZIMAGE_PANEL_HOST permite cambiarlo.'
+      echo 'Panel HTTP/HTTPS: 127.0.0.1 por defecto; ZIMAGE_PANEL_HOST=0.0.0.0 expone en LAN.'
       echo 'La bandeja en / requiere contraseña en LAN: ZIMAGE_PANEL_PASSWORD o data/conversations/panel-password.'
       break ;;
   esac

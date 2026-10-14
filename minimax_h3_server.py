@@ -13,7 +13,9 @@ os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 # workaround used by the previous ROCm installation.
 os.environ.pop("HSA_OVERRIDE_GFX_VERSION", None)
 
-INSTALL_ROOT = os.environ.get("MINIMAX_H3_INSTALL_ROOT", "/home/ignacia")
+INSTALL_ROOT = os.environ.get(
+    "MINIMAX_H3_INSTALL_ROOT", os.environ.get("ZIMAGE_HOME", os.path.expanduser("~"))
+)
 COMFYUI_DIR = os.environ.get("MINIMAX_H3_COMFYUI_DIR", os.path.join(INSTALL_ROOT, "ComfyUI-minimax-h3"))
 MODEL_PATHS = os.environ.get("MINIMAX_H3_MODEL_PATHS", os.path.join(os.path.dirname(__file__), "minimax_h3_model_paths.yaml"))
 port = int(os.environ.get("MINIMAX_H3_PORT", "9879"))

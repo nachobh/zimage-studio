@@ -12,7 +12,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 
-ROOT = Path("/home/ignacia")
+ROOT = Path(os.environ.get("ZIMAGE_HOME", str(Path.home())))
 COMFY = ROOT / "ComfyUI-minimax-h3"
 PORT = 19879
 BASE = f"http://127.0.0.1:{PORT}"

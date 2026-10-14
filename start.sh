@@ -54,7 +54,7 @@ Variables útiles:
   ZIMAGE_AUDIO_DEVICE    auto, cuda o cpu; por defecto auto.
   COMFYUI_START_SCRIPT  Lanzador MiniMax-H3 configurado; por defecto ./levantar_minimax_h3.sh.
   MINIMAX_H3_INSTALL_ROOT Ruta de ComfyUI/venv/modelos (por defecto directorio padre del proyecto).
-  ZIMAGE_PANEL_HOST     Host del panel; por defecto 0.0.0.0.
+  ZIMAGE_PANEL_HOST     Host del panel; por defecto 127.0.0.1 (usa 0.0.0.0 para LAN).
   ZIMAGE_PANEL_PASSWORD Contraseña del panel en LAN (si falta, se genera en data/conversations/panel-password).
   ZIMAGE_PANEL_REQUIRE_AUTH=1 Fuerza inicio de sesión también en loopback.
 EOF
@@ -133,7 +133,7 @@ export LLAMA_MMPROJ="${LLAMA_MMPROJ:-$DATA_DIR/models/qwen/mmproj-BF16.gguf}"
 export ZIMAGE_DATA_DIR="$DATA_DIR"
 export SETTINGS_FILE="${SETTINGS_FILE:-$DATA_DIR/panel-settings.json}"
 export ZIMAGE_LOG_DIR="${ZIMAGE_LOG_DIR:-$DATA_DIR/logs}"
-export PANEL_HOST="${ZIMAGE_PANEL_HOST:-0.0.0.0}"
+export PANEL_HOST="${ZIMAGE_PANEL_HOST:-127.0.0.1}"
 export MCP_BIND="${ZIMAGE_MCP_BIND:-127.0.0.1}"
 if [ "$MODE" = status ]; then
   "$PYTHON_BOOTSTRAP" "$PROJECT_ROOT/zimage_optional_services.py" --status

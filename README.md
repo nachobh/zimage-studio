@@ -38,7 +38,7 @@ publication scope" below for what is actually clean enough to publish.
 - **Panel**: `zimage_panel.py` + `zimage_panel_grid.py` serve the HTML/JS
   frontend (character chat, group chat, gallery, LoRA admin, storage
   auditing).
-- Test suite: ~15 `test_*.py` files covering auth, conversations, media
+- Test suite: 16 `test_*.py` files covering auth, conversations, media
   audit, bootstrap, character training/caption, panel grid behavior, and a
   few "live" tests that require running services and real inference.
 
@@ -61,7 +61,9 @@ publication scope" below for what is actually clean enough to publish.
    MiniMax-H3 / ComfyUI :9879  (image -> short video)
 ```
 
-All services bind to `127.0.0.1` by default; LAN exposure requires an
+All services bind to `127.0.0.1` by default; LAN exposure (binding to
+`0.0.0.0`) is opt-in via `ZIMAGE_PANEL_HOST=0.0.0.0` (panel) or
+`ZIMAGE_SERVER_HOST` (backend server), and requires an
 explicit panel password and, for the "existing install" variant, HTTPS with a
 locally-generated CA (`setup_zimage_https.py`).
 
