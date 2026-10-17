@@ -1,3 +1,6 @@
+/diagnostics/
+diagnostics/
+DIAGNOSTICO_*.md
 .venv/
 vendor/
 data/logs/

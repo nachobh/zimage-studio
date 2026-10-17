@@ -97,10 +97,21 @@ Hard quantitative data in this repo is thin — this is primarily an
 engineering/integration project, not a benchmarked one. The few concrete
 numbers found:
 
-- LoRA training step count is derived directly from configuration:
-  `steps = epochs x photos_used` (documented default 40 epochs; e.g. 5 epochs
-  x 27 photos = 135 steps, described in the README as producing a
-  practically invisible LoRA; 40 epochs x 27 photos = 1,080 steps).
+- LoRA training defaults to exactly 3,000 optimizer steps with batch size 1,
+  learning rate `0.00005`, rank 16, resolution 1024 x 1024, vertical crop
+  centering 0.3, and a minimum photo side of 512 pixels. Smaller photos are
+  skipped unless explicitly included. Automatic scheduling uses
+  `ceil(3000 / photos_used)` epochs and stops partway through the final epoch
+  when necessary. Explicit `--epochs` (1-3000) overrides automatic scheduling:
+  `steps = epochs x photos_used`.
+- Training samples use the first retained photo's caption as a fixed prompt,
+  seed 42, and an interval of 250 steps, including a final sample. Set
+  `--sample-every 0` to disable all samples. Images are saved under a dataset
+  `samples-*` directory and referenced in `training_report.json`. Sampling
+  diffuses on GPU and decodes the VAE on CPU in tiles up to 512 pixels,
+  restoring the training device and VAE settings afterward. LoRA parameters
+  and AdamW moments stay float32; the frozen transformer stays bfloat16 with
+  mixed-precision forward passes. These defaults are not benchmark results.
 - LoRA strength is reported as the median of ‖B·A‖/‖W‖ over adapted modules;
   the README documents an empirical, non-authoritative "healthy" band of
   0.03-0.10, explicitly stating this does not replace visual evaluation, and

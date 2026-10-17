@@ -5,6 +5,7 @@ Requires a complete Diffusers Z-Image checkpoint. A GGUF inference transformer
 cannot provide gradients and is deliberately rejected by the panel preflight.
 """
 import argparse
+import math
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,10 @@ import tempfile
 from PIL import Image
 
 REPORT_NAME = 'training_report.json'
+TARGET_STEPS = 3000
+TRAIN_DEFAULTS = {'epochs': None, 'learning_rate': 5e-5, 'rank': 16, 'resolution': 1024,
+                  'centering_y': 0.3, 'min_size': 512, 'skip_small': True,
+                  'sample_every': 250, 'sample_seed': 42}
 STRENGTH_LOW = 0.01
 STRENGTH_BAND = (0.03, 0.10)
 TRAIN_MODULE = re.compile(r'^layers\.\d+\..+\.(?:to_q|to_k|to_v|to_out\.0|w1|w2|w3)$')
@@ -30,6 +35,63 @@ def training_target_modules(transformer):
     if not counts or any(count != 7 for count in counts.values()):
         raise RuntimeError('No se hallaron los siete módulos LoRA por capa principal del transformer')
     return modules
+
+
+def prepare_trainable_parameters(transformer):
+    """Keep LoRA updates and AdamW moments in FP32, leaving frozen weights intact."""
+    import torch
+    trainable = [parameter for parameter in transformer.parameters() if parameter.requires_grad]
+    if not trainable:
+        raise RuntimeError('PEFT no insertó parámetros entrenables')
+    for parameter in trainable:
+        parameter.data = parameter.data.to(dtype=torch.float32)
+    return trainable
+
+
+def training_schedule(photo_count, epochs=None):
+    """Auto mode stops at 3000 updates, including a partial final epoch."""
+    if photo_count < 1:
+        raise ValueError('Se necesita al menos una foto')
+    steps = TARGET_STEPS if epochs is None else epochs * photo_count
+    return math.ceil(steps / photo_count), steps
+
+
+def training_sample(pipe, prompt, resolution, seed, destination):
+    """Diffuse on GPU, then decode on CPU without changing the training VAE."""
+    import torch
+    was_training = pipe.transformer.training
+    vae = pipe.vae
+    original_device = vae.device
+    original_tiling = (vae.use_tiling, vae.tile_sample_min_size, vae.tile_latent_min_size)
+    try:
+        pipe.transformer.eval()
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]), torch.no_grad():
+            generator = torch.Generator(device='cuda').manual_seed(seed)
+            print('Muestra · iniciando difusión en GPU', flush=True)
+            # Returning latents skips the pipeline's full-frame float32 GPU decode.
+            latents = pipe(prompt=prompt, height=resolution, width=resolution,
+                           num_inference_steps=9, guidance_scale=0.0,
+                           generator=generator, output_type='latent').images
+            latents = latents.detach().to(device='cpu', dtype=vae.dtype)
+            torch.cuda.synchronize()
+            print('Muestra · difusión terminada; decodificando VAE en CPU por bloques', flush=True)
+            vae.to('cpu')
+            vae.enable_tiling()
+            vae.tile_sample_min_size = min(512, original_tiling[1])
+            vae.tile_latent_min_size = vae.tile_sample_min_size // pipe.vae_scale_factor
+            latents = latents / vae.config.scaling_factor + vae.config.shift_factor
+            decoded = vae.decode(latents, return_dict=False)[0]
+            image = pipe.image_processor.postprocess(decoded, output_type='pil')[0]
+            print('Muestra · decodificación terminada; guardando PNG', flush=True)
+            image.save(destination)
+    finally:
+        # Encoding the next training photo must keep its original device and tiling.
+        vae.use_tiling, vae.tile_sample_min_size, vae.tile_latent_min_size = original_tiling
+        try:
+            print('Muestra · restaurando VAE al dispositivo de entrenamiento', flush=True)
+            vae.to(original_device)
+        finally:
+            pipe.transformer.train(was_training)
 
 
 def usable_photos(folder, min_size, keep_small=False):
@@ -94,15 +156,16 @@ def advice_for(report):
     if strength is None:
         advice.append('No se pudo medir la intensidad del LoRA; revisa que el entrenamiento guardó matrices lora_A y lora_B.')
     elif strength < STRENGTH_LOW:
-        advice.append(f'LoRA demasiado débil (Δ {strength:.4f} < {STRENGTH_LOW}): el personaje no se verá. '
-                      f'Aumenta las épocas (60–80) o el learning rate y vuelve a entrenar.')
+        advice.append(f'Actualización de pesos débil según el umbral orientativo (Δ {strength:.4f} < {STRENGTH_LOW}). '
+                      'Este valor no determina el parecido: compáralo con un LoRA de referencia antes de cambiar pasos o learning rate.')
     elif strength > STRENGTH_BAND[1]:
         advice.append(f'LoRA muy intenso (Δ {strength:.4f} > {STRENGTH_BAND[1]}): usa pesos bajos (0.4–0.7) '
                       'para evitar sobreajuste y caras recicladas.')
     elif STRENGTH_BAND[0] <= strength <= STRENGTH_BAND[1]:
         advice.append(f'Intensidad adecuada (Δ {strength:.4f}, banda {STRENGTH_BAND[0]}–{STRENGTH_BAND[1]}).')
     else:
-        advice.append(f'Intensidad algo baja (Δ {strength:.4f}); prueba más épocas o acepta pesos 0.8–1.2.')
+        advice.append(f'Intensidad algo baja respecto a la referencia orientativa (Δ {strength:.4f}); '
+                      'compara visualmente con el LoRA anterior usando los mismos ajustes.')
     advice.append('Compara pesos 0.6, 0.8, 1.0 y 1.2 con las mismas semillas y pasos; '
                   'prueba CFG 0, 0.3 y 1 y conserva la combinación que mejor reproduzca la identidad.')
     advice.append('La banda de intensidad es orientativa; confirma la calidad visual con varias semillas y el mismo prompt.')
@@ -145,8 +208,8 @@ def train(args):
     if len(kept) < 5:
         raise ValueError(f'Quedan {len(kept)} fotos de al menos {args.min_size} px; añade fotos más '
                          'grandes o baja el mínimo de píxeles')
-    steps_total = args.epochs * len(kept)
-    print(f'{len(kept)} fotos · {args.epochs} épocas · {steps_total} pasos · lr {args.learning_rate:g} · '
+    epochs, steps_total = training_schedule(len(kept), args.epochs)
+    print(f'{len(kept)} fotos · {epochs} épocas · {steps_total} pasos · lr {args.learning_rate:g} · '
           f'rango {args.rank} · {args.resolution} px · recorte vertical {args.centering_y:g}', flush=True)
     model = Path(args.model)
     if not (model / 'transformer').is_dir() or not (model / 'model_index.json').is_file():
@@ -163,16 +226,22 @@ def train(args):
                                             target_modules=targets,
                                             lora_dropout=0.0))
     pipe.transformer.enable_gradient_checkpointing()
-    trainable = [p for p in pipe.transformer.parameters() if p.requires_grad]
-    if not trainable:
-        raise RuntimeError('PEFT no insertó parámetros entrenables')
+    trainable = prepare_trainable_parameters(pipe.transformer)
+    print(f'Parámetros LoRA entrenables: {sum(p.numel() for p in trainable)} · '
+          'pesos y optimizador float32 · forward mixto bfloat16', flush=True)
     optimizer = torch.optim.AdamW(trainable, lr=args.learning_rate)
     random.seed(42)
     device = torch.device('cuda')
     step = 0
-    for epoch in range(args.epochs):
+    sample_paths = []
+    sample_prompt = captions[kept[0].name]
+    sample_dir = Path(tempfile.mkdtemp(prefix='samples-', dir=folder)) if args.sample_every else None
+    pipe.transformer.train()
+    for epoch in range(epochs):
         random.shuffle(kept)
         for photo in kept:
+            if step >= steps_total:
+                break
             with Image.open(photo) as source:
                 image = ImageOps.fit(source.convert('RGB'), (args.resolution, args.resolution),
                                      centering=(0.5, args.centering_y))
@@ -198,6 +267,15 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             step += 1
             print(f'Paso {step}/{steps_total} · pérdida {loss.item():.5f}', flush=True)
+            # Release the backward graph before running inference on the same GPU.
+            del loss, predicted, pixels, clean, noise, sample, embeddings
+            if args.sample_every and (step % args.sample_every == 0 or step == steps_total):
+                print(f'Generando muestra del paso {step} · semilla {args.sample_seed}', flush=True)
+                destination = sample_dir / f'step-{step:06d}.png'
+                training_sample(pipe, sample_prompt, args.resolution, args.sample_seed, destination)
+                sample_paths.append(str(destination.relative_to(folder)))
+                print(f'Muestra del paso {step} guardada · semilla {args.sample_seed}', flush=True)
+    print('Guardando matrices LoRA', flush=True)
     weights = {}
     for key, parameter in pipe.transformer.named_parameters():
         if parameter.requires_grad and ('lora_A.' in key or 'lora_B.' in key):
@@ -215,9 +293,15 @@ def train(args):
         if os.path.exists(temp):
             os.unlink(temp)
     print(f'LoRA guardado: {output.name}', flush=True)
+    print('Calculando diagnóstico de intensidad', flush=True)
     strength = _strength(pipe.transformer)
     report = {'photos_used': len(kept), 'photos_skipped': len(skipped),
-              'photos_total': len(photos), 'epochs': args.epochs, 'steps': step,
+              'photos_total': len(photos), 'epochs': epochs, 'steps': step,
+              'automatic_steps': args.epochs is None, 'steps_per_image': step / len(kept),
+              'batch_size': 1, 'sample_every': args.sample_every,
+              'sample_seed': args.sample_seed, 'samples': sample_paths,
+              'sample_decode_device': 'cpu', 'sample_decode_tile_size': 512,
+              'trainable_dtype': 'float32', 'optimizer_moments_dtype': 'float32',
               'learning_rate': args.learning_rate, 'rank': args.rank,
               'resolution': args.resolution, 'min_size': args.min_size,
               'keep_small': bool(args.keep_small), 'centering_y': args.centering_y,
@@ -240,22 +324,25 @@ def build_parser():
     parser.add_argument('--dataset', required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--output', required=True)
-    parser.add_argument('--epochs', type=int, default=40)
-    parser.add_argument('--rank', type=int, default=16)
-    parser.add_argument('--resolution', type=int, default=512)
-    parser.add_argument('--learning-rate', type=float, default=2e-4)
+    parser.add_argument('--epochs', type=int, default=TRAIN_DEFAULTS['epochs'],
+                        help='Pasos por imagen; por defecto 3000 pasos totales / fotos usadas')
+    parser.add_argument('--rank', type=int, default=TRAIN_DEFAULTS['rank'])
+    parser.add_argument('--resolution', type=int, default=TRAIN_DEFAULTS['resolution'])
+    parser.add_argument('--learning-rate', type=float, default=TRAIN_DEFAULTS['learning_rate'])
     parser.add_argument('--min-size', type=int, default=512,
                         help='Lado menor mínimo de una foto para usarla (0 desactiva el filtro)')
     parser.add_argument('--keep-small', action='store_true',
                         help='Entrenar también con fotos por debajo de --min-size')
     parser.add_argument('--centering-y', type=float, default=0.3,
                         help='Centrado vertical del recorte cuadrado (0 arriba, 1 abajo)')
+    parser.add_argument('--sample-every', type=int, default=250, help='Muestra cada N pasos (0 desactiva)')
+    parser.add_argument('--sample-seed', type=int, default=42)
     return parser
 
 
 def check_args(parser, args):
-    if not 1 <= args.epochs <= 200:
-        parser.error('epochs: 1–200')
+    if args.epochs is not None and not 1 <= args.epochs <= 3000:
+        parser.error('epochs: 1–3000')
     if not 4 <= args.rank <= 128:
         parser.error('rank: 4–128')
     if not 256 <= args.resolution <= 1024 or args.resolution % 64:
@@ -266,6 +353,10 @@ def check_args(parser, args):
         parser.error('min-size: 0–2048')
     if not 0 <= args.centering_y <= 1:
         parser.error('centering-y: 0–1')
+    if not 0 <= args.sample_every <= 3000:
+        parser.error('sample-every: 0–3000')
+    if not 0 <= args.sample_seed <= 2**32 - 1:
+        parser.error('sample-seed: 0–4294967295')
     return args
 
 

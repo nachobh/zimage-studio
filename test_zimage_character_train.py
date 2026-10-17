@@ -1,16 +1,17 @@
 """Offline tests for the trainer helpers: no Torch, GPU or model is loaded."""
 import io
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import tempfile
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
-from zimage_character_train import REPORT_NAME, _strength, advice_for, build_parser, check_args, training_target_modules, usable_photos, write_report
+from zimage_character_train import REPORT_NAME, _strength, advice_for, build_parser, check_args, training_target_modules, training_schedule, training_sample, usable_photos, write_report
 
 
 class TrainerHelperTests(unittest.TestCase):
@@ -42,13 +43,67 @@ class TrainerHelperTests(unittest.TestCase):
         parser = build_parser()
         args = check_args(parser, parser.parse_args(['--dataset', 'd', '--model', 'm', '--output', 'o']))
         self.assertEqual((args.epochs, args.learning_rate, args.rank, args.resolution),
-                         (40, 2e-4, 16, 512))
+                         (None, 5e-5, 16, 1024))
+        self.assertEqual((args.sample_every, args.sample_seed), (250, 42))
         self.assertEqual((args.min_size, args.centering_y, args.keep_small), (512, 0.3, False))
         for bad in (['--epochs', '0'], ['--rank', '999'], ['--resolution', '500'],
                     ['--learning-rate', '5'], ['--min-size', '4096'], ['--centering-y', '2']):
             with self.assertRaises(SystemExit):
                 check_args(parser, parser.parse_args(['--dataset', 'd', '--model', 'm',
                                                       '--output', 'o'] + bad))
+
+    def test_automatic_schedule_stops_at_3000_with_small_and_uneven_datasets(self):
+        for count, epochs in ((5, 600), (10, 300), (15, 200), (27, 112), (80, 38)):
+            self.assertEqual(training_schedule(count), (epochs, 3000))
+        self.assertEqual(training_schedule(27, 60), (60, 1620))
+        with self.assertRaises(ValueError):
+            training_schedule(0)
+
+    def test_sample_decodes_on_cpu_and_restores_training_vae_after_success_and_errors(self):
+        for failure in (None, 'diffusion', 'decode', 'save'):
+            with self.subTest(failure=failure):
+                pipe = MagicMock()
+                pipe.transformer.training = True
+                pipe.vae.device = 'cuda:0'
+                pipe.vae.dtype = 'float32'
+                pipe.vae.use_tiling = False
+                pipe.vae.tile_sample_min_size = 1024
+                pipe.vae.tile_latent_min_size = 128
+                pipe.vae_scale_factor = 8
+                def decode(latents, **kwargs):
+                    self.assertEqual(pipe.vae.to.call_args.args, ('cpu',))
+                    self.assertEqual(pipe.vae.tile_sample_min_size, 512)
+                    self.assertEqual(pipe.vae.tile_latent_min_size, 64)
+                    if failure == 'decode':
+                        raise RuntimeError('decode failed')
+                    return [object()]
+                pipe.vae.decode.side_effect = decode
+                if failure == 'diffusion':
+                    pipe.side_effect = RuntimeError('diffusion failed')
+                if failure == 'save':
+                    pipe.image_processor.postprocess.return_value[0].save.side_effect = RuntimeError('save failed')
+                torch = MagicMock()
+                torch.random.fork_rng.return_value = nullcontext()
+                torch.no_grad.return_value = nullcontext()
+                torch.cuda.current_device.return_value = 0
+                with patch.dict(sys.modules, {'torch': torch}):
+                    if failure:
+                        with self.assertRaisesRegex(RuntimeError, failure):
+                            training_sample(pipe, 'fixed prompt', 1024, 42, self.folder / 'sample.png')
+                    else:
+                        training_sample(pipe, 'fixed prompt', 1024, 42, self.folder / 'sample.png')
+                torch.random.fork_rng.assert_called_once_with(devices=[0])
+                torch.Generator.return_value.manual_seed.assert_called_once_with(42)
+                self.assertEqual(pipe.call_args.kwargs['output_type'], 'latent')
+                self.assertEqual(pipe.call_args.kwargs['num_inference_steps'], 9)
+                self.assertEqual(pipe.call_args.kwargs['prompt'], 'fixed prompt')
+                pipe.vae.to.assert_called_with('cuda:0')
+                self.assertEqual((pipe.vae.use_tiling, pipe.vae.tile_sample_min_size,
+                                  pipe.vae.tile_latent_min_size), (False, 1024, 128))
+                pipe.transformer.train.assert_called_once_with(True)
+                if failure != 'diffusion':
+                    pipe.return_value.images.detach.return_value.to.assert_called_once_with(
+                        device='cpu', dtype='float32')
 
     def test_advice_reports_the_strength_band(self):
         weak = advice_for({'rel_median': 0.0003})

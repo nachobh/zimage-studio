@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import io
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,7 +18,7 @@ import wave
 
 from PIL import Image, ImageOps
 
-from zimage_character_train import REPORT_NAME, usable_photos
+from zimage_character_train import REPORT_NAME, TRAIN_DEFAULTS, usable_photos
 from zimage_conversations import image_errors
 
 ROOT = Path(__file__).resolve().parent
@@ -29,8 +31,6 @@ MAX_PIXELS = 24_000_000
 MAX_VOICE_BYTES = 20 * 1024 * 1024
 MAX_VOICE_SECONDS = 30
 VOICE_RE = re.compile(r'data:audio/(?:wav|x-wav);base64,([A-Za-z0-9+/]+={0,2})\Z')
-TRAIN_DEFAULTS = {'epochs': 40, 'learning_rate': 2e-4, 'rank': 16, 'resolution': 512,
-                  'centering_y': 0.3, 'min_size': 512, 'skip_small': True}
 
 
 def training_options(options):
@@ -54,12 +54,15 @@ def training_options(options):
             raise ValueError(f'{key} debe estar entre {low:g} y {high:g}')
         return int(value) if integer else value
 
-    settings = {'epochs': bounded('epochs', 1, 200, integer=True),
+    settings = {'epochs': (None if options.get('epochs') in (None, '')
+                           else bounded('epochs', 1, 3000, integer=True)),
                 'learning_rate': bounded('learning_rate', 1e-6, 1e-3),
                 'rank': bounded('rank', 4, 128, integer=True),
                 'resolution': bounded('resolution', 256, 1024, integer=True),
                 'centering_y': bounded('centering_y', 0, 1),
-                'min_size': bounded('min_size', 0, 2048, integer=True)}
+                'min_size': bounded('min_size', 0, 2048, integer=True),
+                'sample_every': bounded('sample_every', 0, 3000, integer=True),
+                'sample_seed': bounded('sample_seed', 0, 2**32 - 1, integer=True)}
     if settings['resolution'] % 64:
         raise ValueError('resolution debe ser múltiplo de 64')
     skip_small = options.get('skip_small', TRAIN_DEFAULTS['skip_small'])
@@ -112,6 +115,14 @@ class CharacterCreator:
 
     def _job_active(self, name):
         return name in self.jobs and not self.jobs[name]['finished']
+
+    def _editable(self, name):
+        data = self._metadata(name)
+        if self._job_active(name):
+            raise ValueError('Espera a que termine el trabajo antes de modificar el personaje')
+        if data['state'] not in ('draft', 'published'):
+            raise ValueError('Estado de personaje no editable')
+        return data
 
     def create(self, body):
         if not isinstance(body, dict):
@@ -174,9 +185,7 @@ class CharacterCreator:
         if not 128 <= target <= 2048:
             raise ValueError('El tamaño objetivo debe estar entre 128 y 2048 px')
         with self.lock:
-            data = self._metadata(name)
-            if data['state'] != 'draft' or self._job_active(name):
-                raise ValueError('No puedes reescalar fotos durante el trabajo o después de publicar')
+            self._editable(name)
             photos_dir = self.directory(name) / 'photos'
             if photos_dir.is_symlink() or photos_dir.resolve().parent != self.directory(name):
                 raise ValueError('Directorio de fotos no permitido')
@@ -233,9 +242,7 @@ class CharacterCreator:
     def restore_photos(self, name):
         """Undo the batch: move the originals kept in ``photos_original/`` back."""
         with self.lock:
-            data = self._metadata(name)
-            if data['state'] != 'draft' or self._job_active(name):
-                raise ValueError('No puedes restaurar fotos durante el trabajo o después de publicar')
+            self._editable(name)
             photos_dir = self.directory(name) / 'photos'
             backup_dir = self.directory(name) / 'photos_original'
             for path in (photos_dir, backup_dir):
@@ -308,9 +315,7 @@ class CharacterCreator:
         except (wave.Error, EOFError, OSError) as exc:
             raise ValueError('El archivo no es un WAV PCM válido') from exc
         with self.lock:
-            metadata = self._metadata(name)
-            if metadata['state'] != 'draft' or self._job_active(name):
-                raise ValueError('No puedes cambiar el audio durante el trabajo o después de publicar')
+            self._editable(name)
             directory = self.directory(name)
             path = directory / 'voice.wav'
             fd, temp = tempfile.mkstemp(prefix='.voice-', dir=directory)
@@ -326,9 +331,7 @@ class CharacterCreator:
 
     def remove_voice(self, name):
         with self.lock:
-            metadata = self._metadata(name)
-            if metadata['state'] != 'draft' or self._job_active(name):
-                raise ValueError('No puedes cambiar el audio durante el trabajo o después de publicar')
+            self._editable(name)
             path = self.directory(name) / 'voice.wav'
             if path.is_symlink():
                 raise ValueError('Ruta de audio no permitida')
@@ -368,9 +371,7 @@ class CharacterCreator:
         if not 0 < len(raw) <= MAX_BYTES:
             raise ValueError('Foto demasiado grande')
         with self.lock:
-            data = self._metadata(name)
-            if data['state'] != 'draft' or self._job_active(name):
-                raise ValueError('No puedes añadir fotos durante el trabajo o después de publicar')
+            self._editable(name)
             photos_dir = self.directory(name) / 'photos'
             if photos_dir.is_symlink() or photos_dir.resolve().parent != self.directory(name):
                 raise ValueError('Directorio de fotos no permitido')
@@ -404,8 +405,7 @@ class CharacterCreator:
 
     def remove_photo(self, name, filename):
         with self.lock:
-            if self._metadata(name)['state'] != 'draft' or self._job_active(name):
-                raise ValueError('No puedes quitar fotos durante el trabajo o después de publicar')
+            self._editable(name)
             self.photo(name, filename)
             (self.directory(name) / 'photos' / filename).unlink()
             data = self._metadata(name)
@@ -415,9 +415,7 @@ class CharacterCreator:
 
     def update(self, name, body):
         with self.lock:
-            data = self._metadata(name)
-            if self._job_active(name) or data['state'] != 'draft':
-                raise ValueError('Espera a que termine el trabajo')
+            data = self._editable(name)
             profile = body.get('profile') if isinstance(body, dict) else None
             captions = body.get('captions') if isinstance(body, dict) else None
             if not isinstance(profile, dict) or any(not isinstance(profile.get(k), str) or
@@ -434,29 +432,56 @@ class CharacterCreator:
             return self.get(name)
 
     def _run(self, name, stage, command):
+        log = None
+        def record(message):
+            if log is not None:
+                stamp = datetime.now().astimezone().isoformat(timespec='seconds')
+                log.write(f'{stamp} {message.rstrip()}\n')
+                log.flush()
         try:
+            directory = self.directory(name)
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S-')
+            fd, path = tempfile.mkstemp(prefix=f'{stage}-{stamp}', suffix='.log', dir=directory)
+            log = os.fdopen(fd, 'w', encoding='utf-8', buffering=1)
+            record(f'Inicio de {stage}')
+            # Only numeric training settings are recorded; no captions or prompts.
+            flags = ('--epochs', '--rank', '--resolution', '--learning-rate',
+                     '--min-size', '--centering-y', '--sample-every', '--sample-seed')
+            settings = {flag[2:]: command[command.index(flag) + 1]
+                        for flag in flags if flag in command}
+            if settings:
+                record('Parámetros: ' + json.dumps(settings, ensure_ascii=False))
+            with self.lock:
+                self.jobs[name]['log'] = Path(path).name
             proc = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1, env={**os.environ, 'HF_HUB_OFFLINE': '1',
-                                                                'TRANSFORMERS_OFFLINE': '1'})
+                                        'TRANSFORMERS_OFFLINE': '1', 'PYTHONUNBUFFERED': '1'})
             for line in proc.stdout:
+                record(line)
                 with self.lock:
                     self.jobs[name]['status']['detail'] = line.strip()[:300]
             code = proc.wait()
+            record(f'Proceso terminado con código {code}')
             if code:
                 raise RuntimeError(f'{stage} terminó con código {code}: {self.jobs[name]["status"]["detail"]}')
             with self.lock:
                 data = self._metadata(name)
                 if stage == 'captions':
-                    captions_path = self.directory(name) / 'captions.json'
+                    captions_path = directory / 'captions.json'
                     data['captions'].update(json.loads(captions_path.read_text(encoding='utf-8')))
-                    atomic_json(self.directory(name) / 'character.json', data)
+                    atomic_json(directory / 'character.json', data)
                 else:
+                    record('Publicando archivos del LoRA')
                     self._publish(name)
+                record('Completado')
                 self.jobs[name]['status'] = {'stage': stage, 'state': 'done', 'detail': 'Completado'}
         except Exception as exc:
+            record(f'Error: {exc}')
             with self.lock:
                 self.jobs[name]['status'] = {'stage': stage, 'state': 'error', 'detail': str(exc)[:500]}
         finally:
+            if log is not None:
+                log.close()
             with self.lock:
                 self.jobs[name]['finished'] = True
 
@@ -472,15 +497,22 @@ class CharacterCreator:
 
     def caption(self, name):
         data = self.get(name)
-        if data['state'] != 'draft' or not data['photos']:
+        if not data['photos']:
             raise ValueError('Añade fotos antes de crear captions')
         return self._start(name, 'captions', [self.python, str(ROOT / 'zimage_character_caption.py'),
                                              str(self.directory(name))])
 
     def train(self, name, options=None):
+        with self.lock:
+            self._editable(name)
+            if any(not job['finished'] for job in self.jobs.values()):
+                raise ValueError('Ya hay un trabajo BLIP o LoRA en curso; espera a que termine')
+            return self._train(name, options)
+
+    def _train(self, name, options=None):
         settings = training_options(options)
         data = self.get(name)
-        if data['state'] != 'draft' or len(data['photos']) < 5:
+        if len(data['photos']) < 5:
             raise ValueError('Se necesitan al menos 5 fotos antes de entrenar')
         kept, skipped = usable_photos(self.directory(name), settings['min_size'],
                                       keep_small=not settings['skip_small'])
@@ -505,12 +537,15 @@ class CharacterCreator:
         command = [self.python, str(ROOT / 'zimage_character_train.py'),
                    '--dataset', str(self.directory(name)), '--model', str(self.model_dir),
                    '--output', str(self.directory(name) / 'adapter.safetensors'),
-                   '--epochs', str(settings['epochs']),
                    '--rank', str(settings['rank']),
                    '--resolution', str(settings['resolution']),
                    '--learning-rate', str(settings['learning_rate']),
                    '--min-size', str(settings['min_size']),
-                   '--centering-y', str(settings['centering_y'])]
+                   '--centering-y', str(settings['centering_y']),
+                   '--sample-every', str(settings['sample_every']),
+                   '--sample-seed', str(settings['sample_seed'])]
+        if settings['epochs'] is not None:
+            command.extend(['--epochs', str(settings['epochs'])])
         if not settings['skip_small']:
             command.append('--keep-small')
         return self._start(name, 'training', command)
@@ -519,61 +554,68 @@ class CharacterCreator:
         from safetensors import safe_open
         directory = self.directory(name)
         source = directory / 'adapter.safetensors'
+        if source.is_symlink():
+            raise ValueError('Ruta de publicación no permitida')
         with safe_open(source, framework='pt', device='cpu') as model:
             keys = model.keys()
             down = {k[:-len('.lora_A.weight')] for k in keys if k.endswith('.lora_A.weight')}
             up = {k[:-len('.lora_B.weight')] for k in keys if k.endswith('.lora_B.weight')}
             if not down or down != up:
                 raise ValueError('El entrenamiento no produjo un LoRA PEFT compatible')
-        self.lora_dir.mkdir(parents=True, exist_ok=True)
-        target = self.lora_dir / (name + '.safetensors')
-        if any((self.lora_dir / (name + suffix)).exists() or
-               (self.lora_dir / (name + suffix)).is_symlink()
-               for suffix in ('.safetensors', '.json', '.png', '.wav')):
-            raise ValueError('Ya existen archivos del personaje en el catálogo')
-        profile_target = self.lora_dir / (name + '.json')
-        thumb_target = self.lora_dir / (name + '.png')
-        created = []
-        voice_source = directory / 'voice.wav'
-        voice_target = self.lora_dir / (name + '.wav')
-        try:
-            atomic_json(profile_target, self._metadata(name)['profile'])
-            created.append(profile_target)
-            first = next((directory / 'photos').glob('*.jpg'))
-            fd, temp = tempfile.mkstemp(prefix='.new-thumb-', dir=self.lora_dir)
-            try:
-                with Image.open(first) as image, os.fdopen(fd, 'wb') as out:
-                    image.thumbnail((512, 512))
-                    image.save(out, 'PNG')
-                os.replace(temp, thumb_target)
-                created.append(thumb_target)
-            finally:
-                if os.path.exists(temp):
-                    os.unlink(temp)
-            fd, temp = tempfile.mkstemp(prefix='.new-lora-', dir=self.lora_dir)
-            try:
-                with os.fdopen(fd, 'wb') as out, source.open('rb') as src:
-                    while chunk := src.read(1024 * 1024):
-                        out.write(chunk)
-                os.link(temp, target)
-                created.append(target)
-            finally:
-                os.unlink(temp)
-            if voice_source.is_file() and not voice_source.is_symlink():
-                fd, temp = tempfile.mkstemp(prefix='.new-voice-', dir=self.lora_dir)
-                try:
-                    with os.fdopen(fd, 'wb') as out, voice_source.open('rb') as src:
-                        while chunk := src.read(1024 * 1024):
-                            out.write(chunk)
-                    os.link(temp, voice_target)
-                    created.append(voice_target)
-                finally:
-                    if os.path.exists(temp):
-                        os.unlink(temp)
-        except Exception:
-            for path in reversed(created):
-                path.unlink(missing_ok=True)
-            raise
         data = self._metadata(name)
-        data['state'] = 'published'
-        atomic_json(directory / 'character.json', data)
+        replacing = data['state'] == 'published'
+        self.lora_dir.mkdir(parents=True, exist_ok=True)
+        targets = {suffix: self.lora_dir / (name + suffix)
+                   for suffix in ('.safetensors', '.json', '.png', '.wav')}
+        for target in targets.values():
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise ValueError('Ruta de publicación no permitida')
+            if target.exists() and not replacing:
+                raise ValueError('Ya existen archivos del personaje en el catálogo')
+        voice_source = directory / 'voice.wav'
+        if voice_source.is_symlink():
+            raise ValueError('Ruta de publicación no permitida')
+        photos = sorted(photo for photo in (directory / 'photos').glob('*.jpg')
+                        if photo.is_file() and not photo.is_symlink())
+        if not photos:
+            raise ValueError('Se necesita una foto para la miniatura')
+        # Stage the entire bundle first. Hard links preserve the old files cheaply
+        # until every replacement and the published metadata have succeeded.
+        with tempfile.TemporaryDirectory(prefix='.publish-', dir=self.lora_dir) as temp:
+            staging = Path(temp)
+            staged = {suffix: staging / ('new' + suffix) for suffix in targets}
+            shutil.copyfile(source, staged['.safetensors'])
+            atomic_json(staged['.json'], data['profile'])
+            with Image.open(photos[0]) as image:
+                image.thumbnail((512, 512))
+                image.save(staged['.png'], 'PNG')
+            if voice_source.is_file():
+                shutil.copyfile(voice_source, staged['.wav'])
+            backups = {}
+            for suffix, target in targets.items():
+                if target.exists():
+                    backup = staging / ('old' + suffix)
+                    os.link(target, backup)
+                    backups[suffix] = backup
+            changed = []
+            try:
+                for suffix, target in targets.items():
+                    if staged[suffix].exists():
+                        if replacing:
+                            os.replace(staged[suffix], target)
+                        else:
+                            # A new draft must never overwrite another catalog entry.
+                            os.link(staged[suffix], target)
+                    elif suffix == '.wav' and replacing:
+                        # Removing the working voice also removes it on republication.
+                        target.unlink(missing_ok=True)
+                    changed.append(suffix)
+                data['state'] = 'published'
+                atomic_json(directory / 'character.json', data)
+            except Exception:
+                for suffix in reversed(changed):
+                    if suffix in backups:
+                        os.replace(backups[suffix], targets[suffix])
+                    else:
+                        targets[suffix].unlink(missing_ok=True)
+                raise
